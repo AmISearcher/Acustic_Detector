@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
-"""
-Unified detection system + Acoustic 3D PiP overlay.
-
-- Acoustic serial JSON (azimuth/elevation) guides gimbal ONLY when not tracking.
-- Visual detection (DeGirum) initializes CSRT tracker.
-- Visual tracking drives gimbal via PID (acoustic ignored while tracking).
-- If tracking is lost: hold last position for 1 second; if no reacquire -> return to acoustic.
-- Laser distance overlay + CSV logging.
-- Adds a small picture-in-picture 3D acoustic view (unit sphere + direction arrow).
-
-Acoustic restriction logic:
-- Compute signed relative azimuth/elevation around "front".
-- Clamp to ±45° for azimuth and elevation (front cone).
-- If you want *ignore behind hemisphere*, set IGNORE_BEHIND_DEG=90 (recommended).
-"""
-
 import sys
 import time
 import json
 import re
+import math
+import csv
 import threading
 import queue
-import csv
-import math
+import signal
 
 import cv2
 import numpy as np
@@ -33,57 +18,79 @@ from picamera2 import Picamera2
 from base_ctrl import BaseController
 from laser_reader_thread import start_laser_reader, get_laser_distance
 
-# ---- matplotlib offscreen 3D render (PiP overlay)
+# ---- matplotlib offscreen for PiP
 import matplotlib
-matplotlib.use("Agg")  # IMPORTANT: offscreen rendering
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 
-# ----------------------------
-# Config
-# ----------------------------
+# =========================
+# CONFIG
+# =========================
 ACOUSTIC_SERIAL_PORT = "/dev/ttyUSB0"
 ACOUSTIC_BAUD = 115200
 
 GIMBAL_SERIAL_PORT = "/dev/ttyAMA0"
 GIMBAL_BAUD = 115200
 
-FRONT_DEG = 120.0  # raw azimuth that corresponds to "forward"
+# Acoustic "front" reference:
+FRONT_DEG = 120.0
 
-# Allowed acoustic cone around front
+# Acoustic aiming restrictions
 ACOUSTIC_AZ_LIMIT = 45.0
 ACOUSTIC_EL_LIMIT = 45.0
 
-# Optional: ignore acoustic readings beyond this angle from front (behind hemisphere = 90)
-# Set to 180 to "never ignore" (but still clamp to ±45). Recommended: 90.
-IGNORE_BEHIND_DEG = 90.0
+# Ignore behind: if abs(relative_azimuth_from_front) > IGNORE_BEHIND_DEG => ignore reading
+IGNORE_BEHIND_DEG = 90.0  # recommended 90. 180 disables ignore.
 
-# Visual pipeline
+# Visual
 FRAME_SIZE = (640, 640)  # no tiling
 CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
 REDETECT_INTERVAL = 0.5
 LOST_HOLD_TIME = 1.0
 
-# Servo limits
+# Servo mechanical limits
 PAN_LIMIT = 180
 TILT_LIMIT_UP = 90
 TILT_LIMIT_DOWN = -30
 
+# PID / deadzone
 PIX_DEADZONE = 5
+PAN_KP = 0.005
+TILT_KP = 0.005
+PID_OUTPUT_LIMIT = 0.6
 
-# PiP overlay
-PIP_SIZE = (220, 220)       # width, height in pixels
-PIP_MARGIN = 10             # margin from corner
-PIP_CORNER = "top_right"    # "top_left" / "top_right" / "bottom_left" / "bottom_right"
+# PiP acoustic 3D overlay
+PIP_SIZE = (220, 220)        # (W,H)
+PIP_MARGIN = 10
+PIP_CORNER = "top_right"     # top_left, top_right, bottom_left, bottom_right
+PIP_UPDATE_INTERVAL = 0.10   # seconds (lower = smoother, higher = faster main FPS)
+
+# Shutdown behavior
+HOLD_FLUSH_REPEATS = 10
+HOLD_FLUSH_DT = 0.04
+PARK_ON_EXIT = False         # True => park to (0,0) at exit
 
 DEBUG_ACOUSTIC = False
 
 
-# ----------------------------
-# JSON extraction
-# ----------------------------
+# =========================
+# STOP CONTROL
+# =========================
+stop_event = threading.Event()
+
+def _handle_sig(*_):
+    stop_event.set()
+
+signal.signal(signal.SIGINT, _handle_sig)
+signal.signal(signal.SIGTERM, _handle_sig)
+
+
+# =========================
+# UTILS
+# =========================
 JSON_RE = re.compile(r"\{.*\}")
 
 def extract_json_payload(line: str):
@@ -97,78 +104,57 @@ def extract_json_payload(line: str):
     except json.JSONDecodeError:
         return None
 
-
-# ----------------------------
-# Angle + vector math (matching your first script)
-# ----------------------------
-def wrap180(deg: float) -> float:
-    return (deg + 180.0) % 360.0 - 180.0
-
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
+def wrap180(deg: float) -> float:
+    return (deg + 180.0) % 360.0 - 180.0
+
+def rel_az_signed(raw_az: float) -> float:
+    """Signed relative azimuth around FRONT_DEG. 0=front, +left, -right."""
+    return wrap180(raw_az - FRONT_DEG)
+
+def acoustic_to_gimbal_targets(raw_az: float, raw_el: float):
+    """
+    Apply: ignore behind + clamp to ±45°, then map to gimbal pan/tilt.
+    """
+    az = rel_az_signed(raw_az)  # +left, -right
+    el = raw_el                 # assuming elevation around 0; if not, adapt here.
+
+    if abs(az) > IGNORE_BEHIND_DEG:
+        return None, az, el
+
+    az_c = clamp(az, -ACOUSTIC_AZ_LIMIT, ACOUSTIC_AZ_LIMIT)
+    el_c = clamp(el, -ACOUSTIC_EL_LIMIT, ACOUSTIC_EL_LIMIT)
+
+    # Map: az>0 means left, but pan>0 assumed right => invert
+    pan_target = -az_c
+    tilt_target = el_c
+
+    pan_target = clamp(pan_target, -PAN_LIMIT, PAN_LIMIT)
+    tilt_target = clamp(tilt_target, TILT_LIMIT_DOWN, TILT_LIMIT_UP)
+    return (pan_target, tilt_target), az, el
+
+
+# =========================
+# 3D VECTOR (for PiP) — matches your first script
+# =========================
 def azimuth_to_relative_deg(raw_azimuth_deg: float) -> float:
-    # 0° = FRONT, CCW positive
     return (raw_azimuth_deg - FRONT_DEG) % 360.0
 
 def az_el_to_vector(rel_az_deg: float, elev_deg: float):
-    """
-    Drawing coordinates:
-      +Y = forward
-      +X = right
-      +Z = up
-
-    rel_az_deg:
-      0°   = +Y (forward)
-      90°  = left (CCW)
-      180° = back
-      270° = right
-
-    elev_deg:
-      0° horizon, +90° up
-    """
     az = math.radians(rel_az_deg)
     el = math.radians(elev_deg)
-
     c = math.cos(el)
     z = math.sin(el)
-
-    # CCW positive from +Y => left becomes -X
     x = -math.sin(az) * c
     y =  math.cos(az) * c
     return x, y, z
 
-def acoustic_to_gimbal_targets(raw_az: float, raw_el: float):
-    """
-    Convert raw acoustic azimuth/elevation to gimbal pan/tilt targets:
-    1) signed around front in [-180..180)
-    2) ignore if abs(rel) > IGNORE_BEHIND_DEG
-    3) clamp to ±45 (front cone)
-    """
-    rel_az_signed = wrap180(raw_az - FRONT_DEG)  # +left, -right
-    rel_el_signed = raw_el  # if your elevation is already centered around 0; otherwise adapt here.
 
-    if abs(rel_az_signed) > IGNORE_BEHIND_DEG:
-        return None
-    if abs(rel_el_signed) > 180.0:  # safety
-        return None
-
-    rel_az_signed = clamp(rel_az_signed, -ACOUSTIC_AZ_LIMIT, ACOUSTIC_AZ_LIMIT)
-    rel_el_signed = clamp(rel_el_signed, -ACOUSTIC_EL_LIMIT, ACOUSTIC_EL_LIMIT)
-
-    # Map: rel_az_signed positive means left, but servo pan positive assumed right => invert
-    pan_target = -rel_az_signed
-    tilt_target = rel_el_signed
-
-    pan_target = clamp(pan_target, -PAN_LIMIT, PAN_LIMIT)
-    tilt_target = clamp(tilt_target, TILT_LIMIT_DOWN, TILT_LIMIT_UP)
-
-    return pan_target, tilt_target
-
-
-# ----------------------------
+# =========================
 # PID
-# ----------------------------
+# =========================
 class PID:
     def __init__(self, kp, ki, kd, output_limit):
         self.kp = kp
@@ -186,12 +172,13 @@ class PID:
         return clamp(out, -self.output_limit, self.output_limit)
 
 
-# ----------------------------
+# =========================
 # Acoustic reader thread
-# ----------------------------
-acoustic_q = queue.Queue(maxsize=100)
-latest_acoustic_lock = threading.Lock()
-latest_acoustic = None  # store the newest payload for PiP rendering
+# =========================
+acoustic_q = queue.Queue(maxsize=200)
+
+latest_lock = threading.Lock()
+latest_acoustic = None  # for PiP
 
 def acoustic_reader():
     try:
@@ -201,7 +188,8 @@ def acoustic_reader():
         return
 
     try:
-        ser = serial.Serial(ACOUSTIC_SERIAL_PORT, ACOUSTIC_BAUD, timeout=1)
+        # timeout so the thread can exit quickly when stop_event is set
+        ser = serial.Serial(ACOUSTIC_SERIAL_PORT, ACOUSTIC_BAUD, timeout=0.2)
     except Exception as e:
         print(f"Failed to open acoustic serial {ACOUSTIC_SERIAL_PORT}: {e}", file=sys.stderr)
         return
@@ -209,7 +197,7 @@ def acoustic_reader():
     print(f"[INFO] Acoustic serial opened: {ACOUSTIC_SERIAL_PORT} @ {ACOUSTIC_BAUD}")
 
     try:
-        while True:
+        while not stop_event.is_set():
             line = ser.readline()
             if not line:
                 continue
@@ -221,7 +209,7 @@ def acoustic_reader():
             if DEBUG_ACOUSTIC:
                 print("[ACOUSTIC]", payload)
 
-            # keep freshest in queue
+            # queue (freshest)
             try:
                 acoustic_q.put_nowait(payload)
             except queue.Full:
@@ -234,8 +222,8 @@ def acoustic_reader():
                 except queue.Full:
                     pass
 
-            # store newest for PiP
-            with latest_acoustic_lock:
+            # latest for PiP
+            with latest_lock:
                 global latest_acoustic
                 latest_acoustic = payload
 
@@ -246,9 +234,9 @@ def acoustic_reader():
             pass
 
 
-# ----------------------------
-# Detection helpers
-# ----------------------------
+# =========================
+# Detection helpers (no tiling)
+# =========================
 def apply_nms_xyxy(detections, iou_thresh=0.5):
     if not detections:
         return []
@@ -273,8 +261,8 @@ def apply_nms_xyxy(detections, iou_thresh=0.5):
         idx = [i[0] for i in idx]
     return [detections[i] for i in idx]
 
-def run_detection(model, frame):
-    res = model.predict(frame)
+def run_detection(model, frame_bgr):
+    res = model.predict(frame_bgr)
     dets = []
     for det in res.results:
         if det.get("score", 0.0) >= CONF_THRESHOLD:
@@ -282,26 +270,24 @@ def run_detection(model, frame):
     return apply_nms_xyxy(dets, IOU_THRESHOLD)
 
 
-# ----------------------------
+# =========================
 # Matplotlib 3D PiP renderer
-# ----------------------------
+# =========================
 class AcousticPipRenderer:
     def __init__(self, size_px=(220, 220)):
         self.w, self.h = size_px
-
-        # small figure sized for pixels
         dpi = 100
         fig_w = self.w / dpi
         fig_h = self.h / dpi
 
         self.fig = plt.Figure(figsize=(fig_w, fig_h), dpi=dpi)
         self.canvas = FigureCanvas(self.fig)
-
         self.ax = self.fig.add_subplot(111, projection="3d")
+
         self.ax.set_axis_off()
         self.ax.view_init(elev=22, azim=-55)
 
-        # Draw unit sphere wireframe
+        # unit sphere
         u = np.linspace(0, 2*np.pi, 28)
         v = np.linspace(0, np.pi, 14)
         uu, vv = np.meshgrid(u, v)
@@ -310,11 +296,10 @@ class AcousticPipRenderer:
         Z = np.cos(vv)
         self.ax.plot_wireframe(X, Y, Z, linewidth=0.4, alpha=0.25)
 
-        # Axes reference (forward/right/up)
+        # axes
         self.ax.plot([0, 0],   [0, 1.2], [0, 0], linewidth=1.2)   # forward
         self.ax.plot([0, 1.2], [0, 0],   [0, 0], linewidth=1.2)   # right
         self.ax.plot([0, 0],   [0, 0],   [0, 1.2], linewidth=1.2) # up
-
         self.ax.text(0, 1.15, 0, "F", fontsize=8)
         self.ax.text(1.15, 0, 0, "R", fontsize=8)
         self.ax.text(0, 0, 1.15, "U", fontsize=8)
@@ -323,17 +308,13 @@ class AcousticPipRenderer:
         self.ax.set_ylim(-1.2, 1.2)
         self.ax.set_zlim(-1.2, 1.2)
 
-        # Initial arrow
         self.qv = self.ax.quiver(0, 0, 0, 0, 1, 0, length=1.0, normalize=True)
         self.pt = self.ax.scatter([0], [1], [0], s=18)
-
         self.last_img = None
 
-    def render(self, vec_xyz, label_text=None):
-        """Return BGR uint8 image of the 3D view."""
+    def render(self, vec_xyz, label_text=""):
         x, y, z = vec_xyz
 
-        # Update arrow
         try:
             self.qv.remove()
         except Exception:
@@ -341,15 +322,9 @@ class AcousticPipRenderer:
         self.qv = self.ax.quiver(0, 0, 0, x, y, z, length=1.0, normalize=True)
         self.pt._offsets3d = ([x], [y], [z])
 
-        if label_text:
-            self.ax.set_title(label_text, fontsize=8, pad=2)
-        else:
-            self.ax.set_title("", fontsize=8, pad=2)
-
-        # Draw canvas
+        self.ax.set_title(label_text, fontsize=8, pad=2)
         self.canvas.draw()
 
-        # Convert to numpy
         buf = np.frombuffer(self.canvas.tostring_rgb(), dtype=np.uint8)
         img = buf.reshape(self.h, self.w, 3)  # RGB
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
@@ -370,23 +345,22 @@ def overlay_pip(frame_bgr, pip_bgr, corner="top_right", margin=10):
     else:  # bottom_right
         x0, y0 = fw - pw - margin, fh - ph - margin
 
-    # bounds check
-    x0 = clamp(x0, 0, fw - pw)
-    y0 = clamp(y0, 0, fh - ph)
+    x0 = int(clamp(x0, 0, fw - pw))
+    y0 = int(clamp(y0, 0, fh - ph))
 
-    # simple overlay (no alpha)
     frame_bgr[y0:y0+ph, x0:x0+pw] = pip_bgr
     return frame_bgr
 
 
-# ----------------------------
-# Main
-# ----------------------------
+# =========================
+# MAIN
+# =========================
 def main():
     # Start acoustic thread
-    threading.Thread(target=acoustic_reader, daemon=True).start()
+    t_ac = threading.Thread(target=acoustic_reader, daemon=True)
+    t_ac.start()
 
-    # Start laser reader
+    # Start laser thread
     start_laser_reader()
 
     # Load model
@@ -405,14 +379,14 @@ def main():
     )
     picam2.start()
 
-    # Gimbal controller
+    # Gimbal
     base = BaseController(GIMBAL_SERIAL_PORT, GIMBAL_BAUD)
     pan_angle, tilt_angle = 0.0, 0.0
     base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
 
-    # PID for tracking
-    pan_pid = PID(kp=0.005, ki=0.0, kd=0.0, output_limit=0.6)
-    tilt_pid = PID(kp=0.005, ki=0.0, kd=0.0, output_limit=0.6)
+    # PID
+    pan_pid = PID(kp=PAN_KP, ki=0.0, kd=0.0, output_limit=PID_OUTPUT_LIMIT)
+    tilt_pid = PID(kp=TILT_KP, ki=0.0, kd=0.0, output_limit=PID_OUTPUT_LIMIT)
 
     # Tracking state
     tracker = None
@@ -420,16 +394,16 @@ def main():
     last_detection_time = 0.0
     last_track_lost_time = 0.0
 
-    # UI center
+    # Frame center
     cx0 = FRAME_SIZE[0] / 2
     cy0 = FRAME_SIZE[1] / 2
 
-    # CSV log
+    # Logging
     log_file = open("tracking_log.csv", "w", newline="")
     writer = csv.writer(log_file)
     writer.writerow([
         "timestamp",
-        "mode",  # acoustic / hold / tracking
+        "mode",
         "bbox_x", "bbox_y", "bbox_w", "bbox_h",
         "target_cx", "target_cy",
         "offset_x", "offset_y",
@@ -440,40 +414,45 @@ def main():
         "rel_az", "rel_el"
     ])
 
-    fps = 0.0
-
-    # PiP renderer
+    # PiP
     pip = AcousticPipRenderer(size_px=PIP_SIZE)
     last_pip_update = 0.0
-    pip_update_interval = 0.10  # seconds; adjust if you need more FPS
-
-    # latest vector defaults
     vec_xyz = (0.0, 1.0, 0.0)
-    raw_az = None
-    raw_el = None
-    rel_az = None
-    rel_el = None
+    pip_img = pip.render(vec_xyz, "waiting")
+
+    fps = 0.0
+
+    # For CSV
+    last_raw_az = None
+    last_raw_el = None
+    last_rel_az = None
+    last_rel_el = None
 
     try:
-        while True:
+        while not stop_event.is_set():
             t0 = time.time()
-            frame = picam2.capture_array()  # RGB888 from PiCam
-            # OpenCV expects BGR for drawing
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            # Capture RGB -> convert to BGR for OpenCV
+            frame_rgb = picam2.capture_array()
+            frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
             now = time.time()
             mode = "acoustic"
 
-            # ----------------------------
+            bbox_x = bbox_y = bbox_w = bbox_h = -1
+            tx = ty = -1
+            offx = offy = 0
+
+            # =========================
             # TRACKING
-            # ----------------------------
+            # =========================
             if tracking and tracker is not None:
                 success, box = tracker.update(frame)
                 if success:
                     mode = "tracking"
-                    x, y, w, h = map(int, box)
-                    tx = x + w // 2
-                    ty = y + h // 2
+                    bbox_x, bbox_y, bbox_w, bbox_h = map(int, box)
+                    tx = bbox_x + bbox_w // 2
+                    ty = bbox_y + bbox_h // 2
                     offx = tx - cx0
                     offy = ty - cy0
 
@@ -484,33 +463,35 @@ def main():
 
                     pan_angle = clamp(pan_angle, -PAN_LIMIT, PAN_LIMIT)
                     tilt_angle = clamp(tilt_angle, TILT_LIMIT_DOWN, TILT_LIMIT_UP)
+
                     base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
 
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                    cv2.putText(frame, "Tracking", (x, y - 8),
+                    cv2.rectangle(frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (0, 255, 255), 2)
+                    cv2.putText(frame, "Tracking", (bbox_x, bbox_y - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 else:
                     tracking = False
                     tracker = None
                     last_track_lost_time = now
 
-            # ----------------------------
-            # NOT TRACKING: HOLD THEN ACOUSTIC
-            # ----------------------------
+            # =========================
+            # NOT TRACKING: HOLD
+            # =========================
             if not tracking:
-                # Hold last position for LOST_HOLD_TIME after losing tracker
                 if last_track_lost_time and (now - last_track_lost_time) < LOST_HOLD_TIME:
                     mode = "hold"
+                    # keep gimbal as-is (no new commands)
+                    # try re-detect
                     if (now - last_detection_time) >= REDETECT_INTERVAL:
                         dets = run_detection(model, frame)
                         last_detection_time = now
                         if dets:
                             best = max(dets, key=lambda d: d["score"])
                             x1, y1, x2, y2 = map(int, best["bbox"])
-                            ww, hh = x2 - x1, y2 - y1
-                            if ww > 0 and hh > 0:
+                            w, h = x2 - x1, y2 - y1
+                            if w > 0 and h > 0:
                                 tracker = cv2.TrackerCSRT_create()
-                                tracker.init(frame, (x1, y1, ww, hh))
+                                tracker.init(frame, (x1, y1, w, h))
                                 tracking = True
                                 last_track_lost_time = 0.0
 
@@ -521,11 +502,13 @@ def main():
                                 cv2.putText(frame, "Detected", (x1, y1 - 8),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-                # After hold window -> acoustic + detection
-                if not tracking and ((not last_track_lost_time) or (now - last_track_lost_time) >= LOST_HOLD_TIME):
+                # =========================
+                # ACOUSTIC MODE (after hold)
+                # =========================
+                if (not tracking) and ((not last_track_lost_time) or (now - last_track_lost_time) >= LOST_HOLD_TIME):
                     mode = "acoustic"
 
-                    # freshest acoustic payload
+                    # Drain queue, keep newest
                     newest = None
                     while True:
                         try:
@@ -535,31 +518,30 @@ def main():
 
                     if newest is not None:
                         try:
-                            raw_az = float(newest.get("azimuth", 0.0))
-                            raw_el = float(newest.get("elevation", 0.0))
+                            last_raw_az = float(newest.get("azimuth", 0.0))
+                            last_raw_el = float(newest.get("elevation", 0.0))
+                            targets, ra, re = acoustic_to_gimbal_targets(last_raw_az, last_raw_el)
+                            last_rel_az = ra
+                            last_rel_el = re
 
-                            # Signed relative angles (for logging)
-                            rel_az = wrap180(raw_az - FRONT_DEG)
-                            rel_el = raw_el
-
-                            targets = acoustic_to_gimbal_targets(raw_az, raw_el)
                             if targets is not None:
                                 pan_angle, tilt_angle = targets
                                 base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
+                            # else: ignored => do nothing (hold last pose)
                         except Exception:
                             pass
 
-                    # detection periodically
+                    # Run detection periodically
                     if (now - last_detection_time) >= REDETECT_INTERVAL:
                         dets = run_detection(model, frame)
                         last_detection_time = now
                         if dets:
                             best = max(dets, key=lambda d: d["score"])
                             x1, y1, x2, y2 = map(int, best["bbox"])
-                            ww, hh = x2 - x1, y2 - y1
-                            if ww > 0 and hh > 0:
+                            w, h = x2 - x1, y2 - y1
+                            if w > 0 and h > 0:
                                 tracker = cv2.TrackerCSRT_create()
-                                tracker.init(frame, (x1, y1, ww, hh))
+                                tracker.init(frame, (x1, y1, w, h))
                                 tracking = True
                                 last_track_lost_time = 0.0
 
@@ -570,43 +552,39 @@ def main():
                                 cv2.putText(frame, "Detected", (x1, y1 - 8),
                                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # ----------------------------
-            # Update PiP acoustic 3D view (even while tracking)
-            # ----------------------------
-            if (now - last_pip_update) >= pip_update_interval:
+            # =========================
+            # PiP UPDATE (draw acoustic 3D)
+            # =========================
+            if (now - last_pip_update) >= PIP_UPDATE_INTERVAL:
                 last_pip_update = now
-
-                # take latest acoustic payload for visualization
-                with latest_acoustic_lock:
+                with latest_lock:
                     p = latest_acoustic
 
                 if p is not None:
                     try:
-                        raw_az_vis = float(p.get("azimuth", 0.0))
-                        el_vis = float(p.get("elevation", 0.0))
-                        rel_az_vis = azimuth_to_relative_deg(raw_az_vis)
-                        vec_xyz = az_el_to_vector(rel_az_vis, el_vis)
-                        label = f"az {wrap180(raw_az_vis-FRONT_DEG):.0f} | el {el_vis:.0f}"
+                        azp = float(p.get("azimuth", 0.0))
+                        elp = float(p.get("elevation", 0.0))
+                        rel_az_vis = azimuth_to_relative_deg(azp)
+                        vec_xyz = az_el_to_vector(rel_az_vis, elp)
+                        label = f"az {wrap180(azp-FRONT_DEG):.0f} | el {elp:.0f}"
                     except Exception:
                         vec_xyz = (0.0, 1.0, 0.0)
-                        label = "no data"
+                        label = "bad data"
                 else:
                     label = "waiting"
 
-                pip_img = pip.render(vec_xyz, label_text=label)
-            else:
-                pip_img = pip.last_img if pip.last_img is not None else pip.render(vec_xyz, label_text="")
+                pip_img = pip.render(vec_xyz, label)
 
-            # Ensure PiP size (in case)
-            if pip_img.shape[1] != PIP_SIZE[0] or pip_img.shape[0] != PIP_SIZE[1]:
+            # Ensure size
+            if pip_img is not None and (pip_img.shape[1], pip_img.shape[0]) != PIP_SIZE:
                 pip_img = cv2.resize(pip_img, PIP_SIZE)
 
-            # Overlay PiP
-            overlay_pip(frame, pip_img, corner=PIP_CORNER, margin=PIP_MARGIN)
+            if pip_img is not None:
+                overlay_pip(frame, pip_img, corner=PIP_CORNER, margin=PIP_MARGIN)
 
-            # ----------------------------
-            # Overlays: laser, crosshair, mode, fps
-            # ----------------------------
+            # =========================
+            # UI overlays
+            # =========================
             dist = get_laser_distance()
             if dist is not None:
                 cv2.putText(frame, f"Laser: {dist:.2f} m", (10, 30),
@@ -622,48 +600,64 @@ def main():
             cv2.putText(frame, f"FPS: {fps:.2f}", (w - 140, h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-            # ----------------------------
-            # Logging
-            # ----------------------------
-            if tracking and tracker is not None:
-                # last tracker box drawn above; log bbox if available
-                # (when tracking just started, box is drawn by detection too)
-                pass
-
-            # log one line per frame
-            # For tracking mode, bbox/offset are only meaningful when tracker succeeded in this frame.
-            # We'll store -1 when unknown.
+            # =========================
+            # CSV log (one line per frame)
+            # =========================
             writer.writerow([
-                now,
-                mode,
-                -1, -1, -1, -1,
-                -1, -1,
-                0, 0,
+                now, mode,
+                bbox_x, bbox_y, bbox_w, bbox_h,
+                tx, ty,
+                offx, offy,
                 pan_angle, tilt_angle,
-                dist,
+                dist if dist is not None else "",
                 fps,
-                raw_az if raw_az is not None else "",
-                raw_el if raw_el is not None else "",
-                rel_az if rel_az is not None else "",
-                rel_el if rel_el is not None else "",
+                last_raw_az if last_raw_az is not None else "",
+                last_raw_el if last_raw_el is not None else "",
+                last_rel_az if last_rel_az is not None else "",
+                last_rel_el if last_rel_el is not None else "",
             ])
 
-            # Show
-            cv2.imshow("Detection System (Acoustic + PiP 3D)", frame)
-            if cv2.waitKey(1) & 0xFF in (ord("q"), ord("x")):
-                break
+            # =========================
+            # Display + exit
+            # =========================
+            cv2.imshow("Detection System (Acoustic + Tracking + 3D PiP)", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("x")):
+                stop_event.set()
 
     finally:
+        # --- HARD STOP to avoid post-exit twitch ---
+        stop_event.set()
+
+        # stop “effects”
         try:
             base.send_command({"T": 132, "IO4": 0, "IO5": 0})
         except Exception:
             pass
+
+        # override any queued motion by re-sending the same pose a few times
+        try:
+            if PARK_ON_EXIT:
+                pan_angle, tilt_angle = 0.0, 0.0
+
+            for _ in range(HOLD_FLUSH_REPEATS):
+                base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
+                time.sleep(HOLD_FLUSH_DT)
+        except Exception:
+            pass
+
+        # close camera + UI
         try:
             picam2.stop()
         except Exception:
             pass
         cv2.destroyAllWindows()
-        log_file.close()
+
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
         print("[INFO] Finished. Log saved to tracking_log.csv")
 
 

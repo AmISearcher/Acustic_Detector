@@ -446,8 +446,7 @@ def main():
             # =========================
             # TRACKING
             # =========================
-            redetection_need = (now - last_detection_time) >= REDETECT_INTERVAL
-            if tracking and tracker is not None and not redetection_need:
+            if tracking and tracker is not None:
                 success, box = tracker.update(frame)
                 if success:
                     mode = "tracking"
@@ -474,10 +473,6 @@ def main():
                     tracking = False
                     tracker = None
                     last_track_lost_time = now
-            else:
-              tracking = False
-              tracker = None
-              last_track_lost_time = now
 
             # =========================
             # NOT TRACKING: HOLD
@@ -487,32 +482,30 @@ def main():
                     mode = "hold"
                     # keep gimbal as-is (no new commands)
                     # try re-detect
-                    #if (now - last_detection_time) >= REDETECT_INTERVAL:
-                    dets = run_detection(model, frame)
-                    if dets:
+                    if (now - last_detection_time) >= REDETECT_INTERVAL:
+                        dets = run_detection(model, frame)
                         last_detection_time = now
-                        best = max(dets, key=lambda d: d["score"])
-                        x1, y1, x2, y2 = map(int, best["bbox"])
-                        w, h = x2 - x1, y2 - y1
-                        if w > 0 and h > 0:
-                            tracker = cv2.TrackerCSRT_create()
-                            tracker.init(frame, (x1, y1, w, h))
-                            tracking = True
-                            last_track_lost_time = 0.0 # False
-                            mode = "detected"
+                        if dets:
+                            best = max(dets, key=lambda d: d["score"])
+                            x1, y1, x2, y2 = map(int, best["bbox"])
+                            w, h = x2 - x1, y2 - y1
+                            if w > 0 and h > 0:
+                                tracker = cv2.TrackerCSRT_create()
+                                tracker.init(frame, (x1, y1, w, h))
+                                tracking = True
+                                last_track_lost_time = 0.0
 
-                            base.send_command({"T": 132, "IO4": 0, "IO5": 255})
-                            base.send_command({"T": 132, "IO4": 0, "IO5": 0})
+                                base.send_command({"T": 132, "IO4": 0, "IO5": 255})
+                                base.send_command({"T": 132, "IO4": 0, "IO5": 0})
 
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(frame, "Detected", (x1, y1 - 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.putText(frame, "Detected", (x1, y1 - 8),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 # =========================
                 # ACOUSTIC MODE (after hold)
                 # =========================
-                else:
-                #if (not tracking) or (now - last_track_lost_time) >= LOST_HOLD_TIME):
+                if (not tracking) and ((not last_track_lost_time) or (now - last_track_lost_time) >= LOST_HOLD_TIME):
                     mode = "acoustic"
 
                     # Drain queue, keep newest
@@ -541,9 +534,8 @@ def main():
                     # Run detection periodically
                     if (now - last_detection_time) >= REDETECT_INTERVAL:
                         dets = run_detection(model, frame)
+                        last_detection_time = now
                         if dets:
-                            last_detection_time = now
-                            mode = "acoustic detection"
                             best = max(dets, key=lambda d: d["score"])
                             x1, y1, x2, y2 = map(int, best["bbox"])
                             w, h = x2 - x1, y2 - y1

@@ -1,0 +1,8 @@
+base_config:
+  tty: /dev/serial0
+  baud: 115200
+  use_lidar: false
+  lidar_type: rplidar
+  board: driver
+  extra_sensor: false
+

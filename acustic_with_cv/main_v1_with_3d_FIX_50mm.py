@@ -35,11 +35,12 @@ GIMBAL_SERIAL_PORT = "/dev/ttyAMA0"
 GIMBAL_BAUD = 115200
 
 # Acoustic "front" reference:
-FRONT_DEG = 120.0
+FRONT_DEG = 110.0
+EL_DEG =0
 
 # Acoustic aiming restrictions
-ACOUSTIC_AZ_LIMIT = 45.0
-ACOUSTIC_EL_LIMIT = 45.0
+ACOUSTIC_AZ_LIMIT = 70.0
+ACOUSTIC_EL_LIMIT = 70.0
 
 # Ignore behind: if abs(relative_azimuth_from_front) > IGNORE_BEHIND_DEG => ignore reading
 IGNORE_BEHIND_DEG = 90.0  # recommended 90. 180 disables ignore.
@@ -58,15 +59,9 @@ TILT_LIMIT_DOWN = -30
 
 # PID / deadzone
 PIX_DEADZONE = 5
-PAN_KP = 0.005
-TILT_KP = 0.005
+PAN_KP = 0.00005
+TILT_KP = 0.00005
 PID_OUTPUT_LIMIT = 0.6
-
-# PID motion smoothing (used ONLY in tracking/PID mode)
-PID_ERR_LP_TAU_S = 0.08        # error low-pass time constant (seconds)
-PID_MAX_SPEED_DPS = 12.0       # max commanded slew speed (deg/s)
-PID_MAX_ACCEL_DPS2 = 120.0     # max commanded acceleration (deg/s^2)
-PID_DT_MAX = 0.10              # cap dt to avoid jumps after stalls
 
 # PiP acoustic 3D overlay
 PIP_SIZE = (220, 220)        # (W,H)
@@ -113,30 +108,23 @@ def extract_json_payload(line: str):
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
-def soft_deadband(e: float, db: float) -> float:
-    """
-    Continuous deadband: 0 inside ±db, otherwise removes db while preserving sign.
-    Helps avoid a hard discontinuity at the deadzone edge.
-    """
-    ae = abs(e)
-    if ae <= db:
-        return 0.0
-    return math.copysign(ae - db, e)
-
 def wrap180(deg: float) -> float:
     return (deg + 180.0) % 360.0 - 180.0
 
 def rel_az_signed(raw_az: float) -> float:
     """Signed relative azimuth around FRONT_DEG. 0=front, +left, -right."""
     return wrap180(raw_az - FRONT_DEG)
+def rel_el_signed(raw_el: float) -> float:
+    return wrap180(raw_el - EL_DEG)
 
 def acoustic_to_gimbal_targets(raw_az: float, raw_el: float):
     """
     Apply: ignore behind + clamp to ±45°, then map to gimbal pan/tilt.
     """
     az = rel_az_signed(raw_az)  # +left, -right
-    el = raw_el                 # assuming elevation around 0; if not, adapt here.
-
+    #el = raw_el
+    el = rel_el_signed(raw_el)                 # assuming elevation around 0; if not, adapt here.
+    
     if abs(az) > IGNORE_BEHIND_DEG:
         return None, az, el
 
@@ -180,101 +168,13 @@ class PID:
         self.prev_error = 0.0
         self.integral = 0.0
 
-def compute(self, error: float, dt: float) -> float:
-    """
-    Discrete PID with dt-aware I and D terms.
-    Output is still clamped to output_limit, matching your prior behavior.
-    """
-    dt = max(1e-3, float(dt))
+    def compute(self, error):
+        self.integral += error
+        derivative = error - self.prev_error
+        self.prev_error = error
+        out = self.kp * error + self.ki * self.integral + self.kd * derivative
+        return clamp(out, -self.output_limit, self.output_limit)
 
-    # Candidate integral update
-    new_integral = self.integral + error * dt
-    derivative = (error - self.prev_error) / dt
-
-    # Raw output using the candidate integral
-    out = (self.kp * error) + (self.ki * new_integral) + (self.kd * derivative)
-
-    # Simple clamping anti-windup: if saturated, don't accept the integral growth
-    out_sat = clamp(out, -self.output_limit, self.output_limit)
-    if out_sat == out:
-        self.integral = new_integral
-
-    self.prev_error = error
-    return out_sat
-
-class FirstOrderLowPass:
-    """
-    First-order low-pass filter with time constant tau:
-    y <- y + alpha*(x - y), alpha = dt/(tau+dt)
-    """
-    def __init__(self, tau_s: float):
-        self.tau = float(tau_s)
-        self.y = 0.0
-        self.inited = False
-
-    def reset(self, value: float = 0.0):
-        self.y = float(value)
-        self.inited = True
-
-    def step(self, x: float, dt: float) -> float:
-        if not self.inited:
-            self.reset(x)
-            return self.y
-        dt = max(0.0, float(dt))
-        if self.tau <= 0.0 or dt <= 0.0:
-            self.y = float(x)
-            return self.y
-        alpha = dt / (self.tau + dt)
-        self.y = self.y + alpha * (float(x) - self.y)
-        return self.y
-
-class AxisTrapezoidProfile:
-    """
-    Online trapezoidal motion profile generator for POSITION commands:
-    - limits speed (deg/s)
-    - limits acceleration (deg/s^2)
-    Produces much smoother gimbal motion than direct step commands.
-    """
-    def __init__(self, max_speed_dps: float, max_accel_dps2: float):
-        self.max_speed = float(max_speed_dps)
-        self.max_accel = float(max_accel_dps2)
-        self.pos = None
-        self.vel = 0.0
-
-    def reset(self, pos: float):
-        self.pos = float(pos)
-        self.vel = 0.0
-
-    def step(self, target_pos: float, dt: float) -> float:
-        if self.pos is None:
-            self.reset(target_pos)
-            return self.pos
-
-        dt = float(dt)
-        if dt <= 0.0:
-            return self.pos
-        if dt > PID_DT_MAX:
-            dt = PID_DT_MAX
-
-        target_pos = float(target_pos)
-        err = target_pos - self.pos
-
-        # Desired velocity to reach target in one step, limited by max speed
-        v_des = clamp(err / dt, -self.max_speed, self.max_speed)
-
-        # Acceleration limit
-        dv_max = self.max_accel * dt
-        dv = clamp(v_des - self.vel, -dv_max, dv_max)
-        self.vel = clamp(self.vel + dv, -self.max_speed, self.max_speed)
-
-        # Integrate position; prevent overshoot by snapping if we would cross target.
-        step = self.vel * dt
-        if abs(step) >= abs(err):
-            self.pos = target_pos
-            self.vel = 0.0
-        else:
-            self.pos += step
-        return self.pos
 
 # =========================
 # Acoustic reader thread
@@ -293,7 +193,7 @@ def acoustic_reader():
 
     try:
         # timeout so the thread can exit quickly when stop_event is set
-        ser = serial.Serial(ACOUSTIC_SERIAL_PORT, ACOUSTIC_BAUD, timeout=0.2)
+        ser = serial.Serial(ACOUSTIC_SERIAL_PORT, ACOUSTIC_BAUD, timeout=0.1)
     except Exception as e:
         print(f"Failed to open acoustic serial {ACOUSTIC_SERIAL_PORT}: {e}", file=sys.stderr)
         return
@@ -477,7 +377,7 @@ def main():
     )
 
     # Camera
-    picam2 = Picamera2()
+    picam2 = Picamera2(0)
     picam2.configure(
         picam2.create_preview_configuration(main={"format": "RGB888", "size": FRAME_SIZE})
     )
@@ -486,19 +386,11 @@ def main():
     # Gimbal
     base = BaseController(GIMBAL_SERIAL_PORT, GIMBAL_BAUD)
     pan_angle, tilt_angle = 0.0, 0.0
-    base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
+    base.gimbal_ctrl(pan_angle, tilt_angle, 300, 50)
 
     # PID
-    pan_pid = PID(kp=PAN_KP, ki=0.0, kd=0.0, output_limit=PID_OUTPUT_LIMIT)
-    tilt_pid = PID(kp=TILT_KP, ki=0.0, kd=0.0, output_limit=PID_OUTPUT_LIMIT)
-
-    # PID motion shaping (ONLY used in tracking mode)
-    pan_err_lp = FirstOrderLowPass(tau_s=PID_ERR_LP_TAU_S)
-    tilt_err_lp = FirstOrderLowPass(tau_s=PID_ERR_LP_TAU_S)
-    pan_profile = AxisTrapezoidProfile(PID_MAX_SPEED_DPS, PID_MAX_ACCEL_DPS2)
-    tilt_profile = AxisTrapezoidProfile(PID_MAX_SPEED_DPS, PID_MAX_ACCEL_DPS2)
-    pid_state_inited = False
-    last_pid_ts = time.time()
+    pan_pid = PID(kp=PAN_KP, ki=0.00007, kd=0.0, output_limit=PID_OUTPUT_LIMIT)
+    tilt_pid = PID(kp=TILT_KP, ki=0.00007, kd=0.0, output_limit=PID_OUTPUT_LIMIT)
 
     # Tracking state
     tracker = None
@@ -554,88 +446,110 @@ def main():
             bbox_x = bbox_y = bbox_w = bbox_h = -1
             tx = ty = -1
             offx = offy = 0
+            
+            
+            # Run detection periodically
+            if (now - last_detection_time) >= REDETECT_INTERVAL:
+                print("Need Redetect")
+                dets = run_detection(model, frame)
+                if dets:
+                    last_detection_time = now
+                    best = max(dets, key=lambda d: d["score"])
+                    x1, y1, x2, y2 = map(int, best["bbox"])
+                    w, h = x2 - x1, y2 - y1
+                    if w > 0 and h > 0:
+                        tracker = cv2.TrackerCSRT_create()
+                        tracker.init(frame, (x1, y1, w, h))
+                        tracking = True
+                        last_track_lost_time = 0.0
 
-            # =========================
-            # TRACKING
-            # =========================
-            redetection_need = (now - last_detection_time) >= REDETECT_INTERVAL
-            if tracking and tracker is not None and not redetection_need:
-                success, box = tracker.update(frame)
-                if success:
-                    # --- PID motion update (smoothed) ---
-                    if not pid_state_inited:
-                        pid_state_inited = True
-                        last_pid_ts = now
-                        pan_err_lp.reset(0.0)
-                        tilt_err_lp.reset(0.0)
-                        pan_profile.reset(pan_angle)
-                        tilt_profile.reset(tilt_angle)
+                        base.send_command({"T": 132, "IO4": 0, "IO5": 255})
+                        base.send_command({"T": 132, "IO4": 0, "IO5": 0})
 
-                    dt = clamp(now - last_pid_ts, 1e-3, PID_DT_MAX)
-                    last_pid_ts = now
-
-                    # Soft deadband in pixels (continuous at boundary)
-                    ex = soft_deadband(offx, PIX_DEADZONE)
-                    ey = soft_deadband(-offy, PIX_DEADZONE)  # invert Y like your original
-
-                    # Filter pixel error to suppress tracker jitter
-                    ex = pan_err_lp.step(ex, dt)
-                    ey = tilt_err_lp.step(ey, dt)
-
-                    # Raw PID target angles (still clamped like before)
-                    pan_target = clamp(pan_angle + pan_pid.compute(ex, dt), -PAN_LIMIT, PAN_LIMIT)
-                    tilt_target = clamp(tilt_angle + tilt_pid.compute(ey, dt), TILT_LIMIT_DOWN, TILT_LIMIT_UP)
-
-                    # Motion profile shaping: limits speed + acceleration of the command
-                    pan_angle = pan_profile.step(pan_target, dt)
-                    tilt_angle = tilt_profile.step(tilt_target, dt)
-
-                    base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(frame, "Detected", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
                     tracking = False
                     tracker = None
                     last_track_lost_time = now
-                    pid_state_inited = False
+                
+            # =========================
+            # TRACKING
+            # =========================
+            #now = time.time()
+            #need_redetect = (now - last_detection_time) >= REDETECT_INTERVAL
+            #if tracking and tracker is not None and need_redetect:
             else:
-              tracking = False
-              tracker = None
-              last_track_lost_time = now
-              pid_state_inited = False
+                print("Skip detection")
+            if tracking and tracker is not None:
+                success, box = tracker.update(frame)
+                if success:
+                    mode = "tracking"
+                    bbox_x, bbox_y, bbox_w, bbox_h = map(int, box)
+                    tx = bbox_x + bbox_w // 2
+                    ty = bbox_y + bbox_h // 2
+                    offx = tx - cx0
+                    offy = ty - cy0
+
+                    if abs(offx) > PIX_DEADZONE:
+                        pan_angle += pan_pid.compute(offx)
+                    if abs(offy) > PIX_DEADZONE:
+                        ######## Changes ########
+                        tilt_angle += tilt_pid.compute(-offy)
+
+                    pan_angle = clamp(pan_angle, -PAN_LIMIT, PAN_LIMIT)
+                    tilt_angle = clamp(tilt_angle, TILT_LIMIT_DOWN, TILT_LIMIT_UP)
+
+                    base.gimbal_ctrl(pan_angle, tilt_angle, 300, 50)
+
+                    cv2.rectangle(frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (0, 255, 255), 2)
+                    cv2.putText(frame, "Tracking", (bbox_x, bbox_y - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                else:
+                    tracking = False
+                    tracker = None
+                    last_track_lost_time = time.time()
+            #else:
+            #    tracking = False
+            #    tracker = None
+            #    last_track_lost_time = now
 
             # =========================
             # NOT TRACKING: HOLD
             # =========================
             if not tracking:
-                if last_track_lost_time and (now - last_track_lost_time) < LOST_HOLD_TIME:
+                if last_track_lost_time and ((time.time()- last_detection_time) < LOST_HOLD_TIME):
+                    print("Hold")
                     mode = "hold"
                     # keep gimbal as-is (no new commands)
                     # try re-detect
-                    #if (now - last_detection_time) >= REDETECT_INTERVAL:
-                    dets = run_detection(model, frame)
-                    if dets:
-                        last_detection_time = now
-                        best = max(dets, key=lambda d: d["score"])
-                        x1, y1, x2, y2 = map(int, best["bbox"])
-                        w, h = x2 - x1, y2 - y1
-                        if w > 0 and h > 0:
-                            tracker = cv2.TrackerCSRT_create()
-                            tracker.init(frame, (x1, y1, w, h))
-                            tracking = True
-                            last_track_lost_time = 0.0 # False
-                            mode = "detected"
+                    if (now - last_detection_time) >= REDETECT_INTERVAL:
+                        dets = run_detection(model, frame)
+                        now = time.time()
+                        if dets:
+                            last_detection_time = now
+                            best = max(dets, key=lambda d: d["score"])
+                            x1, y1, x2, y2 = map(int, best["bbox"])
+                            w, h = x2 - x1, y2 - y1
+                            if w > 0 and h > 0:
+                                tracker = cv2.TrackerCSRT_create()
+                                tracker.init(frame, (x1, y1, w, h))
+                                tracking = True
+                                last_track_lost_time = 0.0
 
-                            base.send_command({"T": 132, "IO4": 0, "IO5": 255})
-                            base.send_command({"T": 132, "IO4": 0, "IO5": 0})
+                                base.send_command({"T": 132, "IO4": 0, "IO5": 255})
+                                base.send_command({"T": 132, "IO4": 0, "IO5": 0})
 
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(frame, "Detected", (x1, y1 - 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.putText(frame, "Detected", (x1, y1 - 8),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 # =========================
                 # ACOUSTIC MODE (after hold)
                 # =========================
-                else:
-                #if (not tracking) or (now - last_track_lost_time) >= LOST_HOLD_TIME):
+
+                if (not tracking) and ((time.time() - last_detection_time) >= LOST_HOLD_TIME):
+                    print("Acoustic")
                     mode = "acoustic"
 
                     # Drain queue, keep newest
@@ -650,13 +564,13 @@ def main():
                         try:
                             last_raw_az = float(newest.get("azimuth", 0.0))
                             last_raw_el = float(newest.get("elevation", 0.0))
-                            targets, ra, re = acoustic_to_gimbal_targets(last_raw_az, last_raw_el)
+                            targets, ra, re = acoustic_to_gimbal_targets(last_raw_az, last_raw_el-10)
                             last_rel_az = ra
                             last_rel_el = re
 
                             if targets is not None:
                                 pan_angle, tilt_angle = targets
-                                base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
+                                base.gimbal_ctrl(pan_angle, tilt_angle, 300, 50)
                             # else: ignored => do nothing (hold last pose)
                         except Exception:
                             pass
@@ -666,7 +580,6 @@ def main():
                         dets = run_detection(model, frame)
                         if dets:
                             last_detection_time = now
-                            mode = "acoustic detection"
                             best = max(dets, key=lambda d: d["score"])
                             x1, y1, x2, y2 = map(int, best["bbox"])
                             w, h = x2 - x1, y2 - y1
@@ -772,7 +685,7 @@ def main():
                 pan_angle, tilt_angle = 0.0, 0.0
 
             for _ in range(HOLD_FLUSH_REPEATS):
-                base.gimbal_ctrl(pan_angle, tilt_angle, 0, 0)
+                base.gimbal_ctrl(pan_angle, tilt_angle, 300, 50)
                 time.sleep(HOLD_FLUSH_DT)
         except Exception:
             pass

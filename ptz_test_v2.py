@@ -55,7 +55,7 @@ QUERY_POS_EVERY_S = 0.0   # 0.0 disables; e.g. 0.5 queries twice per second
 # =========================
 # "velocity" mode params
 # =========================
-MAX_PAN_SPEED_DEGPS  = 410.0   # desired max deg/s (firmware caps anyway)
+MAX_PAN_SPEED_DEGPS  = 570.0   # desired max deg/s (firmware caps anyway)
 MAX_TILT_SPEED_DEGPS = 360.0
 
 # Smooth accel/braking (deg/s^2). Higher = snappier, lower = smoother.

@@ -36,16 +36,17 @@ PRINT_ID = True           # send I\n and print response
 
 # Choose: "velocity" or "bounce"
 MODE = "velocity"
+#MODE = "bounce"
 
 # Mechanical/firmware limits (set SAFE values!)
-PAN_MIN = -180.0
-PAN_MAX =  180.0
+PAN_MIN = -2880.0
+PAN_MAX =  2880.0
 TILT_MIN = -30.0
 TILT_MAX =  90.0
 
 # Command sending behavior
-PTZ_SEND_HZ = 40.0        # how often we send P/T (30–60 Hz typical)
-MIN_DEG_STEP = 0.35       # do NOT send micro-updates smaller than this (deg)
+PTZ_SEND_HZ = 60.0        # how often we send P/T (30–60 Hz typical)
+MIN_DEG_STEP = 0.5       # do NOT send micro-updates smaller than this (deg)
 SEND_TILT_TOO = False     # for pure fast pan test, keep tilt fixed
 
 # Optional position querying (slows overall throughput; keep OFF for max speed)
@@ -56,8 +57,8 @@ QUERY_POS_EVERY_S = 0.0   # 0.0 disables; e.g. 0.5 queries twice per second
 # =========================
 # This is the "how fast do we try to move" setting.
 # If too high, controller still caps at firmware max, but you force it to try hard.
-MAX_PAN_SPEED_DEGPS  = 240.0   # deg/s  (try 120..360)
-MAX_TILT_SPEED_DEGPS = 120.0   # deg/s
+MAX_PAN_SPEED_DEGPS  = 410.0   # deg/s  (try 120..360)
+MAX_TILT_SPEED_DEGPS = 360.0   # deg/s
 
 # constant "stick" values in [-1..+1]; set sign to choose direction
 STICK_X = +1.0   # +1.0 = pan right; -1.0 = pan left; 0.0 = stop pan

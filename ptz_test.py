@@ -1,59 +1,62 @@
 import serial
 import time
 
-PORT = "/dev/ttyUSB0"   # якщо треба — заміни на /dev/ttyACM0
+PORT = "/dev/ttyUSB0"   # або /dev/ttyACM0
 BAUD = 115200
 
-def read_line(ser):
+def send(ser, cmd: str):
+    ser.write((cmd + "\n").encode("ascii"))
+
+def read_line(ser) -> str:
     raw = ser.readline()
     if not raw:
         return ""
     return raw.decode("utf-8", errors="replace").strip()
 
-def send(ser, cmd):
-    ser.write((cmd + "\n").encode("ascii"))
+def query_pos(ser):
+    send(ser, "?")
+    line = read_line(ser)
+    # expected: POS:90.50,-15.00
+    if line.startswith("POS:"):
+        try:
+            payload = line.split("POS:", 1)[1]
+            a, b = payload.split(",", 1)
+            return float(a), float(b), line
+        except Exception:
+            return None, None, line
+    return None, None, line
+
+def move_and_report(ser, pan, tilt=None, wait=1.5):
+    if pan is not None:
+        send(ser, f"P{pan:.2f}")
+    if tilt is not None:
+        send(ser, f"T{tilt:.2f}")
+    time.sleep(wait)
+    p, t, raw = query_pos(ser)
+    print(f"After move P={pan} T={tilt} -> {raw}")
 
 print("[INFO] Opening port...")
 ser = serial.Serial(PORT, BAUD, timeout=0.2)
 time.sleep(2.0)  # MCU reset
 
-print("[INFO] Identify:")
 send(ser, "I")
-print("->", read_line(ser))
+print("[ID ]", read_line(ser))
 
-print("[INFO] Set ZERO")
 send(ser, "Z")
-print("->", read_line(ser))
+print("[ZERO]", read_line(ser))
 
-time.sleep(0.5)
+# read initial pos
+p0, t0, raw0 = query_pos(ser)
+print("[POS0]", raw0)
 
-# =========================
-# TEST 1: 0 → 90 degrees
-# =========================
-print("\n[TEST] Moving to +90°")
-start = time.time()
-send(ser, "P90")
+# Try a few targets
+for target in [10, 30, 60, 90, 120, -10, -30, -60, -90]:
+    print(f"\n[TEST] P{target}")
+    move_and_report(ser, pan=target, tilt=None, wait=1.5)
 
-# чекаємо поки приблизно доїде
-time.sleep(3)
-
-elapsed = time.time() - start
-print(f"Time approx to 90°: {elapsed:.2f} seconds")
-
-# =========================
-# TEST 2: 90 → -90 degrees
-# =========================
-print("\n[TEST] Moving to -90°")
-start = time.time()
-send(ser, "P-90")
-
-time.sleep(3)
-
-elapsed = time.time() - start
-print(f"Time approx to -90°: {elapsed:.2f} seconds")
-
-print("\n[INFO] Emergency stop")
+print("\n[STOP]")
 send(ser, "S")
+print(read_line(ser))
 
 ser.close()
 print("[INFO] Done.")

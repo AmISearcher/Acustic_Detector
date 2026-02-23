@@ -20,8 +20,8 @@ GIMBAL_INIT_SLEEP_S = 2.0
 
 # Firmware limits (real clamp may be inside MCU)
 PAN_LIMIT = 2880
-TILT_LIMIT_UP = 90
-TILT_LIMIT_DOWN = -30
+TILT_LIMIT_UP = 900
+TILT_LIMIT_DOWN = -900
 
 # Tracking tuning
 PIX_DEADZONE = 3

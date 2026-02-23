@@ -1,70 +1,295 @@
 #!/usr/bin/env python3
-import serial
+# -*- coding: utf-8 -*-
+
+"""
+FAST PTZ test driver (USB Virtual COM) for API:
+  P<float>\n, T<float>\n, Z\n, S\n, ?\n, I\n
+
+Goal: make gimbal move as fast as possible from the PC side.
+Reality: max speed is ultimately limited by firmware + motor/power/mechanics.
+
+Two modes:
+  MODE = "velocity"  -> integrate deg/s into absolute P/T (best for "joystick-like speed")
+  MODE = "bounce"    -> alternate absolute targets between limits (forces accel)
+
+Run:
+  python3 fast_ptz.py
+Stop:
+  Ctrl+C  (sends S\n)
+"""
+
 import time
+import signal
+import sys
+import serial
 
 # =========================
-# CONFIG
+# CONFIG (EDIT THESE)
 # =========================
-PORT = "/dev/ttyUSB0"   # або /dev/ttyACM0
+PORT = "/dev/ttyUSB0"     # default; may be /dev/ttyACM0
 BAUD = 115200
+SER_TIMEOUT = 0.05        # read timeout
+WRITE_TIMEOUT = 0.2
 
-PAN_MIN = -180
-PAN_MAX = 180
+ZERO_ON_START = True      # send Z\n after connect
+PRINT_ID = True           # send I\n and print response
 
-SEND_HZ = 50.0          # не більше 50 команд/сек
-MOVE_DELAY = 0.05       # пауза між великими цілями
+# Choose: "velocity" or "bounce"
+MODE = "velocity"
+
+# Mechanical/firmware limits (set SAFE values!)
+PAN_MIN = -180.0
+PAN_MAX =  180.0
+TILT_MIN = -30.0
+TILT_MAX =  90.0
+
+# Command sending behavior
+PTZ_SEND_HZ = 40.0        # how often we send P/T (30–60 Hz typical)
+MIN_DEG_STEP = 0.35       # do NOT send micro-updates smaller than this (deg)
+SEND_TILT_TOO = False     # for pure fast pan test, keep tilt fixed
+
+# Optional position querying (slows overall throughput; keep OFF for max speed)
+QUERY_POS_EVERY_S = 0.0   # 0.0 disables; e.g. 0.5 queries twice per second
 
 # =========================
+# "velocity" mode params
+# =========================
+# This is the "how fast do we try to move" setting.
+# If too high, controller still caps at firmware max, but you force it to try hard.
+MAX_PAN_SPEED_DEGPS  = 240.0   # deg/s  (try 120..360)
+MAX_TILT_SPEED_DEGPS = 120.0   # deg/s
 
-def send(ser, cmd: str):
-    ser.write((cmd + "\n").encode("ascii"))
+# constant "stick" values in [-1..+1]; set sign to choose direction
+STICK_X = +1.0   # +1.0 = pan right; -1.0 = pan left; 0.0 = stop pan
+STICK_Y =  0.0   # +1.0 tilt up, -1.0 tilt down
+
+# If you want auto-bounce in velocity mode when hitting limits:
+VELOCITY_AUTO_BOUNCE = True   # reverses direction at limits
+
+# =========================
+# "bounce" mode params
+# =========================
+BOUNCE_PAN_A = PAN_MIN
+BOUNCE_PAN_B = PAN_MAX
+BOUNCE_TILT  = 0.0
+
+# How do we switch direction in bounce mode?
+# - If USE_QUERY_FOR_BOUNCE=True and ? works reliably: reverse when near target
+# - Else: reverse with fixed time slices (simpler, fastest comms)
+USE_QUERY_FOR_BOUNCE = False
+NEAR_TARGET_DEG = 3.0         # "close enough" threshold (deg)
+BOUNCE_SLICE_S = 1.0          # seconds before switching target (if not using query)
+
+# =========================
+# END CONFIG
+# =========================
+
+
+stop_flag = False
+
+def on_sigint(sig, frame):
+    global stop_flag
+    stop_flag = True
+
+signal.signal(signal.SIGINT, on_sigint)
+signal.signal(signal.SIGTERM, on_sigint)
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+def send_line(ser: serial.Serial, line: str):
+    ser.write((line + "\n").encode("ascii", errors="ignore"))
+
+def read_line(ser: serial.Serial) -> str:
+    raw = ser.readline()
+    if not raw:
+        return ""
+    return raw.decode("utf-8", errors="replace").strip()
+
+def query_pos(ser: serial.Serial):
+    send_line(ser, "?")
+    line = read_line(ser)
+    # expected: POS:90.50,-15.00
+    if line.startswith("POS:"):
+        try:
+            payload = line.split("POS:", 1)[1]
+            a, b = payload.split(",", 1)
+            return float(a), float(b), line
+        except Exception:
+            return None, None, line
+    return None, None, line
 
 def main():
-    print("[INFO] Opening port...")
-    ser = serial.Serial(PORT, BAUD, timeout=0.1)
-    time.sleep(2.0)  # MCU reset
+    print(f"[INFO] Opening {PORT} @ {BAUD} ...")
+    ser = serial.Serial(
+        PORT,
+        BAUD,
+        timeout=SER_TIMEOUT,
+        write_timeout=WRITE_TIMEOUT
+    )
 
-    print("[INFO] Identify:")
-    send(ser, "I")
-    print(ser.readline().decode(errors="replace").strip())
+    # Many MCU boards reset on serial open:
+    time.sleep(2.0)
 
-    print("[INFO] Set ZERO")
-    send(ser, "Z")
-    print(ser.readline().decode(errors="replace").strip())
+    # Flush any boot text
+    try:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+    except Exception:
+        pass
 
-    time.sleep(0.3)
+    if PRINT_ID:
+        send_line(ser, "I")
+        time.sleep(0.05)
+        print("[ID ]", read_line(ser) or "(no response)")
 
-    print("[INFO] TURBO SPIN MODE STARTED")
-    print("Press Ctrl+C to stop")
+    if ZERO_ON_START:
+        send_line(ser, "Z")
+        time.sleep(0.05)
+        resp = read_line(ser)
+        if resp:
+            print("[ZERO]", resp)
+        else:
+            print("[ZERO] (no response)")
 
+    # Start at current defined zero
+    pan = 0.0
+    tilt = 0.0
+    pan = clamp(pan, PAN_MIN, PAN_MAX)
+    tilt = clamp(tilt, TILT_MIN, TILT_MAX)
+
+    # Sending loop timing
+    send_dt = 1.0 / max(1e-6, PTZ_SEND_HZ)
     last_send = 0.0
-    send_dt = 1.0 / SEND_HZ
+    last_query = 0.0
 
-    direction = 1  # 1 -> to max, -1 -> to min
+    last_sent_pan = pan
+    last_sent_tilt = tilt
+
+    # For bounce mode state
+    bounce_target_pan = BOUNCE_PAN_B
+    bounce_target_tilt = clamp(BOUNCE_TILT, TILT_MIN, TILT_MAX)
+    bounce_last_switch = time.time()
+
+    # For velocity mode direction handling
+    stick_x = float(STICK_X)
+    stick_y = float(STICK_Y)
+
+    print(f"[INFO] MODE={MODE}")
+    print("[INFO] Ctrl+C to STOP")
+
+    t_prev = time.time()
 
     try:
-        while True:
+        while not stop_flag:
             now = time.time()
+            dt = now - t_prev
+            t_prev = now
 
-            if (now - last_send) >= send_dt:
-                if direction > 0:
-                    target = PAN_MAX
+            # -------------------------
+            # MODE: velocity integration
+            # -------------------------
+            if MODE.lower() == "velocity":
+                # Convert stick -> speed
+                pan_speed = stick_x * MAX_PAN_SPEED_DEGPS
+                tilt_speed = stick_y * MAX_TILT_SPEED_DEGPS
+
+                # Integrate speed -> absolute setpoint
+                pan += pan_speed * dt
+                tilt += tilt_speed * dt
+
+                # Limit handling
+                if VELOCITY_AUTO_BOUNCE:
+                    if pan >= PAN_MAX:
+                        pan = PAN_MAX
+                        stick_x = -abs(stick_x) if stick_x != 0 else -1.0
+                    elif pan <= PAN_MIN:
+                        pan = PAN_MIN
+                        stick_x = +abs(stick_x) if stick_x != 0 else +1.0
+
+                    if tilt >= TILT_MAX:
+                        tilt = TILT_MAX
+                        stick_y = -abs(stick_y) if stick_y != 0 else -1.0
+                    elif tilt <= TILT_MIN:
+                        tilt = TILT_MIN
+                        stick_y = +abs(stick_y) if stick_y != 0 else +1.0
                 else:
-                    target = PAN_MIN
+                    pan = clamp(pan, PAN_MIN, PAN_MAX)
+                    tilt = clamp(tilt, TILT_MIN, TILT_MAX)
 
-                send(ser, f"P{target}")
+            # -------------------------
+            # MODE: aggressive bounce
+            # -------------------------
+            elif MODE.lower() == "bounce":
+                # Choose target
+                target_pan = clamp(bounce_target_pan, PAN_MIN, PAN_MAX)
+                target_tilt = clamp(bounce_target_tilt, TILT_MIN, TILT_MAX)
+
+                # Update setpoint directly (absolute)
+                pan = target_pan
+                tilt = target_tilt
+
+                if USE_QUERY_FOR_BOUNCE:
+                    # Reverse when close to current target
+                    if QUERY_POS_EVERY_S > 0 and (now - last_query) >= QUERY_POS_EVERY_S:
+                        last_query = now
+                        p, t, raw = query_pos(ser)
+                        # If we can parse position, reverse near target
+                        if p is not None:
+                            if abs(p - target_pan) <= NEAR_TARGET_DEG:
+                                bounce_target_pan = BOUNCE_PAN_A if bounce_target_pan == BOUNCE_PAN_B else BOUNCE_PAN_B
+                else:
+                    # Time-sliced bounce (fastest, no query overhead)
+                    if (now - bounce_last_switch) >= BOUNCE_SLICE_S:
+                        bounce_last_switch = now
+                        bounce_target_pan = BOUNCE_PAN_A if bounce_target_pan == BOUNCE_PAN_B else BOUNCE_PAN_B
+
+            else:
+                print(f"[ERR] Unknown MODE: {MODE}")
+                break
+
+            # -------------------------
+            # Rate-limited sending + MIN_DEG_STEP
+            # -------------------------
+            if (now - last_send) >= send_dt:
+                do_send_pan = abs(pan - last_sent_pan) >= MIN_DEG_STEP
+                do_send_tilt = SEND_TILT_TOO and (abs(tilt - last_sent_tilt) >= MIN_DEG_STEP)
+
+                # Always send pan if big change; send tilt only if enabled
+                if do_send_pan:
+                    send_line(ser, f"P{pan:.2f}")
+                    last_sent_pan = pan
+
+                if do_send_tilt:
+                    send_line(ser, f"T{tilt:.2f}")
+                    last_sent_tilt = tilt
+
+                # If you want tilt fixed but still explicitly commanded once at start:
+                # you can set SEND_TILT_TOO=True and STICK_Y=0
+
                 last_send = now
 
-                # переключаємо напрямок
-                direction *= -1
+            # Optional, low-rate info query (can reduce speed—use sparingly)
+            if QUERY_POS_EVERY_S > 0 and (now - last_query) >= QUERY_POS_EVERY_S:
+                last_query = now
+                p, t, raw = query_pos(ser)
+                if raw:
+                    print("[POS]", raw)
 
-            time.sleep(MOVE_DELAY)
+            # Small sleep to reduce CPU; do not oversleep relative to send_dt
+            time.sleep(0.001)
 
-    except KeyboardInterrupt:
-        print("\n[INFO] STOP")
-        send(ser, "S")
-        ser.close()
-        print("[INFO] Done.")
+    finally:
+        # Emergency STOP
+        try:
+            send_line(ser, "S")
+        except Exception:
+            pass
+        try:
+            ser.close()
+        except Exception:
+            pass
+        print("\n[INFO] Stopped (S sent) and port closed.")
 
 if __name__ == "__main__":
     main()

@@ -1,55 +1,70 @@
-import serial, time, math
+#!/usr/bin/env python3
+import serial
+import time
 
-PORT="/dev/ttyUSB0"
-ser = serial.Serial(PORT, 115200, timeout=0.1)
-time.sleep(2)
+# =========================
+# CONFIG
+# =========================
+PORT = "/dev/ttyUSB0"   # або /dev/ttyACM0
+BAUD = 115200
 
-def send(cmd: str):
+PAN_MIN = -180
+PAN_MAX = 180
+
+SEND_HZ = 50.0          # не більше 50 команд/сек
+MOVE_DELAY = 0.05       # пауза між великими цілями
+
+# =========================
+
+def send(ser, cmd: str):
     ser.write((cmd + "\n").encode("ascii"))
 
-# set zero
-send("Z")
-time.sleep(0.2)
+def main():
+    print("[INFO] Opening port...")
+    ser = serial.Serial(PORT, BAUD, timeout=0.1)
+    time.sleep(2.0)  # MCU reset
 
-pan = 0.0
-tilt = 0.0
+    print("[INFO] Identify:")
+    send(ser, "I")
+    print(ser.readline().decode(errors="replace").strip())
 
-MAX_PAN_SPEED  = 120.0  # deg/s (піднімай, якщо хочеш швидше)
-MAX_TILT_SPEED = 60.0   # deg/s
+    print("[INFO] Set ZERO")
+    send(ser, "Z")
+    print(ser.readline().decode(errors="replace").strip())
 
-PAN_MIN, PAN_MAX = -180, 180
-TILT_MIN, TILT_MAX = -30, 90
+    time.sleep(0.3)
 
-last = time.time()
+    print("[INFO] TURBO SPIN MODE STARTED")
+    print("Press Ctrl+C to stop")
 
-while True:
-    now = time.time()
-    dt = now - last
-    last = now
+    last_send = 0.0
+    send_dt = 1.0 / SEND_HZ
 
-    # ---- EMULATE joystick axis [-1..+1]
-    # e.g. sine wave from -1..+1
-    stick_x = math.sin(now * 0.6)
-    stick_y = 0.0
+    direction = 1  # 1 -> to max, -1 -> to min
 
-    # deadzone like joystick
-    if abs(stick_x) < 0.05: stick_x = 0.0
-    if abs(stick_y) < 0.05: stick_y = 0.0
+    try:
+        while True:
+            now = time.time()
 
-    # speed control
-    pan_speed  = stick_x * MAX_PAN_SPEED
-    tilt_speed = stick_y * MAX_TILT_SPEED
+            if (now - last_send) >= send_dt:
+                if direction > 0:
+                    target = PAN_MAX
+                else:
+                    target = PAN_MIN
 
-    # integrate to position
-    pan  += pan_speed * dt
-    tilt += tilt_speed * dt
+                send(ser, f"P{target}")
+                last_send = now
 
-    # clamp to limits
-    pan  = max(PAN_MIN, min(PAN_MAX, pan))
-    tilt = max(TILT_MIN, min(TILT_MAX, tilt))
+                # переключаємо напрямок
+                direction *= -1
 
-    # send absolute position
-    send(f"P{pan:.2f}")
-    send(f"T{tilt:.2f}")
+            time.sleep(MOVE_DELAY)
 
-    time.sleep(0.01)  # ~100 Hz loop
+    except KeyboardInterrupt:
+        print("\n[INFO] STOP")
+        send(ser, "S")
+        ser.close()
+        print("[INFO] Done.")
+
+if __name__ == "__main__":
+    main()

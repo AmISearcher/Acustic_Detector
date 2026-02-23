@@ -31,10 +31,11 @@ PAN_KP = 2.0
 TILT_KP = 2.0
 
 MAX_PAN_SPEED = 570.0
-MAX_TILT_SPEED = 360.0
-
 MAX_PAN_ACCEL = 1500.0
-MAX_TILT_ACCEL = 1000.0
+
+MAX_TILT_SPEED = 220.0        # менша макс. швидкість по tilt
+MAX_TILT_ACCEL = 350.0        # набагато плавніше прискорення
+MAX_TILT_DECEL = 700.0        # гальмування можна швидше ніж розгін
 
 PTZ_SEND_HZ = 60.0
 MIN_DEG_STEP = 0.5
@@ -82,7 +83,27 @@ class UsbPTZ:
     def close(self):
         self.ser.close()
 
+def accel_decel(current, target, accel_up, accel_down, dt):
+    """
+    accel_up   = max accel when speeding up in same direction (deg/s^2)
+    accel_down = max decel when slowing down / reversing (deg/s^2)
+    """
+    diff = target - current
 
+    # if we're reducing magnitude or reversing direction -> use decel limit
+    same_dir = (current == 0.0) or (target == 0.0) or ((current > 0) == (target > 0))
+    reducing_mag = abs(target) < abs(current)
+
+    use_decel = (not same_dir) or reducing_mag
+    a = accel_down if use_decel else accel_up
+
+    max_step = a * dt
+    if diff > max_step:
+        diff = max_step
+    elif diff < -max_step:
+        diff = -max_step
+
+    return current + diff
 # =========================
 # MAIN
 # =========================
@@ -131,7 +152,7 @@ def main():
             now = time.time()
             dt = now - t_prev
             t_prev = now
-
+            dt = clamp(dt, 0.0, 0.05)  # max 50ms step
             frame_rgb = picam2.capture_array()
             frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
@@ -150,6 +171,12 @@ def main():
                     # PID -> target speed
                     target_pan_speed = clamp(PAN_KP * offx, -MAX_PAN_SPEED, MAX_PAN_SPEED)
                     target_tilt_speed = clamp(-TILT_KP * offy, -MAX_TILT_SPEED, MAX_TILT_SPEED)
+                    # If direction flips hard, force a brief zero-crossing to avoid "stuck" behavior
+                    if current_tilt_speed != 0.0 and target_tilt_speed != 0.0:
+                        if (current_tilt_speed > 0) != (target_tilt_speed > 0):
+                            # require passing through near-zero before reversing hard
+                            if abs(current_tilt_speed) > 40.0:   # threshold deg/s
+                                target_tilt_speed = 0.0
 
                     if abs(offx) < PIX_DEADZONE:
                         target_pan_speed = 0.0
@@ -163,8 +190,11 @@ def main():
                         diff = clamp(diff, -max_step, max_step)
                         return current + diff
 
-                    current_pan_speed = accel(current_pan_speed, target_pan_speed, MAX_PAN_ACCEL)
-                    current_tilt_speed = accel(current_tilt_speed, target_tilt_speed, MAX_TILT_ACCEL)
+                    current_pan_speed  = accel_decel(current_pan_speed,  target_pan_speed,
+                                                     MAX_PAN_ACCEL, MAX_PAN_ACCEL*1.2, dt)
+
+                    current_tilt_speed = accel_decel(current_tilt_speed, target_tilt_speed,
+                                                     MAX_TILT_ACCEL, MAX_TILT_DECEL, dt)
 
                     # Integrate velocity -> position
                     pan += current_pan_speed * dt
@@ -173,6 +203,12 @@ def main():
                     pan = clamp(pan, -PAN_LIMIT, PAN_LIMIT)
                     tilt = clamp(tilt, TILT_LIMIT_DOWN, TILT_LIMIT_UP)
 
+                    # if we hit limits, kill speed pushing into the limit
+                    if (tilt >= TILT_LIMIT_UP and current_tilt_speed > 0):
+                        current_tilt_speed = 0.0
+                    if (tilt <= TILT_LIMIT_DOWN and current_tilt_speed < 0):
+                        current_tilt_speed = 0.0
+
                     cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0,255,255), 2)
 
                 else:
@@ -180,13 +216,18 @@ def main():
                     tracker = None
                     current_pan_speed = 0.0
                     current_tilt_speed = 0.0
+                    ptz.stop()
 
-            # Rate-limited send
+            # Rate-limited send (send when PAN or TILT changes enough)
             if (now - last_send) >= send_dt:
-                if abs(pan - last_sent_pan) >= MIN_DEG_STEP:
+                pan_changed = abs(pan - last_sent_pan) >= MIN_DEG_STEP
+                tilt_changed = abs(tilt - last_sent_tilt) >= (MIN_DEG_STEP * 0.5)  # smaller step for tilt
+
+                if pan_changed or tilt_changed:
                     ptz.move_abs(pan, tilt)
                     last_sent_pan = pan
                     last_sent_tilt = tilt
+
                 last_send = now
 
             cv2.imshow("FAST Tracking PTZ", frame)
@@ -198,6 +239,15 @@ def main():
                 tracker = cv2.TrackerCSRT_create()
                 tracker.init(frame, (x0, y0, sq, sq))
                 tracking = True
+            elif key == ord('r'):
+                tracking = False
+                tracker = None
+                current_pan_speed = 0.0
+                current_tilt_speed = 0.0
+            elif key == ord('s'):
+                current_pan_speed = 0.0
+                current_tilt_speed = 0.0
+                ptz.stop()
 
     finally:
         ptz.stop()
